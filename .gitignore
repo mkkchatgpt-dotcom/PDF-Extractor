@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Uploaded/generated files
+uploads/
+exports/
+
+# React
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# EXE
+*.exe
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
