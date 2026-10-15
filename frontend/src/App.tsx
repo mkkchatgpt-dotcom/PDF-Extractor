@@ -13,7 +13,7 @@ type RecordItem = {
 };
 type FileResult = {
   filename: string;
-  summary: { pages: number; annotations: number };
+  summary: { pages: number; annotations: number; scanned_pages?: number; text_sheet_pages?: number; callouts?: number; ink_marks?: number; highlight_regions?: number; ocr_available?: boolean; ocr_error?: string | null };
   records: RecordItem[];
   success: boolean;
   error: string | null;
@@ -142,8 +142,14 @@ export default function App() {
                   <div className="pdf-summary">
                     <div><span>Pages</span><strong>{pdf.summary.pages}</strong></div>
                     <div><span>Annotations</span><strong>{pdf.summary.annotations}</strong></div>
+                    {!!pdf.summary.scanned_pages && <div><span>Scanned pages (OCR)</span><strong>{pdf.summary.scanned_pages}</strong></div>}
+                    {!!pdf.summary.text_sheet_pages && <div><span>Typed pages read in full</span><strong>{pdf.summary.text_sheet_pages}</strong></div>}
 
+                    {!!pdf.summary.callouts && <div><span>Callouts</span><strong>{pdf.summary.callouts}</strong></div>}
+                    {!!pdf.summary.highlight_regions && <div><span>Highlighted regions</span><strong>{pdf.summary.highlight_regions}</strong></div>}
+                    {!!pdf.summary.ink_marks && <div><span>Pen marks</span><strong>{pdf.summary.ink_marks}</strong></div>}
                   </div>
+                  {!!pdf.summary.scanned_pages && pdf.summary.ocr_available === false && <div className="error">This PDF contains {pdf.summary.scanned_pages} scanned page(s), but the OCR engine could not be started, so scanned comments could not be read.{pdf.summary.ocr_error ? <><br /><small>Reason: {pdf.summary.ocr_error}</small></> : null}</div>}
                   <div className="table-wrap"><table>
                     <thead><tr>{HEADERS.map(header => <th key={header} scope="col">{header}</th>)}</tr></thead>
                     <tbody>{!pdf.records.length ? <tr><td colSpan={HEADERS.length} className="empty">No PDF annotations were found.</td></tr> : pdf.records.map((item, index) => (

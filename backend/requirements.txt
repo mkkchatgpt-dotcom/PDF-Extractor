@@ -1,6 +1,20 @@
+# PDF Review Extractor - backend dependencies
+# Install:  pip install -r requirements.txt
+
 fastapi
-uvicorn[standard]
+uvicorn
 python-multipart
-pymupdf
-pikepdf
+pymupdf>=1.24
 openpyxl
+numpy
+
+# OCR for scanned pages, flattened callouts and pen marks.
+# Pulls in onnxruntime, opencv-python, pyclipper and shapely.
+# It ships its own .onnx models - no Tesseract install needed.
+rapidocr-onnxruntime==1.2.3
+
+# Optional: better word spacing on typed comment sheets.
+# wordninja
+
+# Build the EXE
+pyinstaller
