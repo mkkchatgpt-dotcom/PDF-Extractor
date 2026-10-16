@@ -403,6 +403,109 @@ def _read_regions(engine, images):
     return outcomes
 
 
+def _read_regions_shared_turn(engine, images, state=None):
+    """
+    Like _read_regions, but works out the rotation ONCE per page instead of
+    once per box.
+
+    The detector-based rotation test costs two to four slow OCR runs per box
+    and was ~90% of the time on a page full of callouts. So:
+
+      * the first box of each shape (tall / wide / square) on the page gets
+        the quick rotation test (_quick_turn, a few milliseconds), and the
+        slow test only when the quick one is not clear-cut;
+      * the other boxes of that shape on the page are read straight in that
+        turn, since every callout on a page is turned the same way;
+      * a box that then reads as nothing gets the full test after all.
+
+    `state` is accepted for compatibility and unused.
+    Returns [(text, orientation_name), ...] like _read_regions.
+    """
+
+    page_turns = {}
+    outcomes = []
+
+    def full_test(img, group):
+        # 1. Quick test (a few milliseconds): cut the box into text lines in
+        #    each turn and ask the up/down classifier about them.
+        name = _quick_turn(engine, img)
+
+        if name is not None:
+            page_turns[group] = name
+            return _read_image_text(engine, _rotate(img, name)), name
+
+        # 2. Unclear (packed text, a single word...): the slow full test.
+        scores = _score_orientations(engine, img)
+
+        if scores is None:
+            return _read_without_classifier(engine, img)
+
+        ranked = sorted(scores, key=scores.get, reverse=True)
+        best = ranked[0]
+        margin = scores[best] - (scores[ranked[1]] if len(ranked) > 1 else 0.0)
+
+        if margin >= ORIENTATION_CONFIDENT_MARGIN:
+            page_turns[group] = best
+
+        return _read_image_text(engine, _rotate(img, best)), best
+
+    for img in images:
+
+        group = _group_of(img)
+
+        # Same shape already settled on this page: just read it.
+        if group in page_turns:
+            name = page_turns[group]
+            text = _read_image_text(engine, _rotate(img, name))
+
+            if _has_content(text, 2):
+                outcomes.append((text, name))
+            else:
+                outcomes.append(full_test(img, group))
+
+            continue
+
+        outcomes.append(full_test(img, group))
+
+    return outcomes
+
+
+QUICK_TURN_MIN_UPRIGHT = 0.75  # share of lines the classifier calls upright
+
+
+def _quick_turn(engine, img):
+    """
+    Fast orientation test without the text detector.
+
+    In the right turn the box splits into horizontal text lines and the
+    up/down classifier calls them upright. In a wrong quarter turn no text
+    lines are found at all; upside down, the classifier calls them flipped.
+    Returns the single turn that passes, or None when it is not clear-cut.
+    """
+
+    passing = []
+
+    for name in _ROTATIONS:
+
+        try:
+            crops = _segment_lines(_rotate(img, name))
+
+            if not crops:
+                continue
+
+            _, labels, _ = engine.text_cls([crop.copy() for crop in crops])
+
+        except Exception:
+            return None
+
+        upright = sum(1 for label, _conf in labels if str(label) == "0")
+
+        if upright / len(labels) >= QUICK_TURN_MIN_UPRIGHT:
+            passing.append(name)
+
+    return passing[0] if len(passing) == 1 else None
+
+
 def _read_without_classifier(engine, img):
     """Fallback when the engine has no classifier access: best text quality."""
 
@@ -937,6 +1040,45 @@ def _fallback_read(engine, image):
     return text or ""
 
 
+def _blob_turns(img):
+    """
+    Quarter turns worth trying for one ink blob, most likely first.
+
+    A wide blob is a horizontal line of writing: upright, or upside down on
+    a page scanned the wrong way round. A tall blob is writing turned a
+    quarter (a rotated page, or a note along the margin).
+    """
+
+    height, width = img.shape[:2]
+
+    if width > 1.3 * height:
+        return ["upright", "flip"]
+
+    if height > 1.3 * width:
+        return ["cw", "ccw"]
+
+    return ["upright", "cw", "ccw"]
+
+
+def _read_ink_blob(engine, image):
+    """
+    Read one blob of review ink, stopping at the first turn that gives text.
+
+    Each attempt costs one OCR run, so a blob with no writing in it (a line,
+    an arrow, a tick) costs at most two or three quick reads instead of the
+    full orientation search.
+    """
+
+    for name in _blob_turns(image):
+
+        text = _fallback_read(engine, _rotate(image, name))
+
+        if _has_content(text, 3):
+            return text
+
+    return ""
+
+
 def extract_scanned_comments(page):
     """
     Return [{"text": str, "rect": pymupdf.Rect}] for coloured review text
@@ -997,18 +1139,7 @@ def extract_scanned_comments(page):
 
     for (x, y, w, h), image in zip(blobs, images):
 
-        # Handwriting on a scan is upright: the plain reader copes with it
-        # better than orientation voting, which is the fallback.
-        text = _fallback_read(engine, image)
-
-        # Sideways comment (rotated page / reviewer wrote along the margin):
-        # read each plausible quarter turn and keep the clearest reading.
-        # The up/down classifier is unreliable on a single thin line.
-        if not _has_content(text, 3):
-            text = _read_without_classifier(engine, image)[0]
-
-        if not _has_content(text, 3):
-            text = _read_regions(engine, [image])[0][0]
+        text = _read_ink_blob(engine, image)
 
         if not _has_content(text, 3):
             continue
@@ -1035,6 +1166,11 @@ def extract_scanned_comments(page):
 # one record per numbered point.
 
 TEXT_SHEET_DPI = 220
+
+# Upright orientation score above which a typed page is accepted as upright
+# without testing the other turns (a sideways or upside-down page scores
+# below zero; a normal upright page scores in the thousands).
+UPRIGHT_ACCEPT_SCORE = 300.0
 TEXT_SHEET_MAX_LONG_LINES = 3  # page edges / one rule are tolerated
 TEXT_SHEET_MIN_ROWS = 3
 
@@ -1172,9 +1308,25 @@ def _best_orientation_rows(engine, rgb):
             rgb, None, fx=factor, fy=factor, interpolation=cv2.INTER_AREA
         )
 
-    scores = {}
+    # Nearly every scanned sheet is upright. When the upright reading is
+    # clearly upright (lines horizontal and the right way up), skip testing
+    # the other three turns - that saves about half the time per page.
+    upright = _orientation_score(engine, small)
+
+    if upright is not None and upright >= UPRIGHT_ACCEPT_SCORE:
+        return _ocr_rows(engine, rgb), rgb
+
+    scores = {} if upright is None else {"upright": upright}
 
     for name in _ROTATIONS:
+
+        if upright is None:
+            scores = None
+            break
+
+        if name == "upright":
+            continue
+
         value = _orientation_score(engine, _rotate(small, name))
 
         if value is None:
@@ -1469,13 +1621,85 @@ def _callout_image(page, rect):
     return np.ascontiguousarray(img)
 
 
-def extract_callout_comments(page, state=None):
+CALLOUT_SKIP_OVERLAP = 0.3
+
+
+def _covered_share(rect, other):
+    """Share of `rect` covered by `other` (0..1)."""
+
+    area = rect.width * rect.height
+
+    if area <= 0:
+        return 0.0
+
+    common = rect & other
+
+    if common.is_empty:
+        return 0.0
+
+    return (common.width * common.height) / area
+
+
+CALLOUT_INK_DIFFERENCE = 150  # how far from the box fill a pixel must be
+CALLOUT_COLOURED_SATURATION = 80
+CALLOUT_COLOURED_MIN_VALUE = 50
+
+
+def coloured_text_share(img):
+    """
+    Share (0..1) of the writing inside a callout box that is coloured.
+
+    The box fill is the most common colour; "writing" is every pixel clearly
+    different from it. A reviewer's callout is written in colour (blue, red)
+    and scores ~0.9; a boxed drawing label (black text in a yellow box)
+    scores 0.
+    """
+
+    if cv2 is None or img is None or img.size == 0:
+        return 0.0
+
+    pixels = img.reshape(-1, 3).astype(np.int32)
+
+    # Most common colour = the box fill (colours packed into one integer).
+    packed = (pixels[:, 0] << 16) | (pixels[:, 1] << 8) | pixels[:, 2]
+    common = int(np.bincount(packed).argmax())
+    fill = np.array([(common >> 16) & 255, (common >> 8) & 255, common & 255])
+
+    ink = np.abs(pixels - fill).sum(axis=1) > CALLOUT_INK_DIFFERENCE
+
+    if not ink.any():
+        return 0.0
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).reshape(-1, 3)[ink]
+
+    coloured = (hsv[:, 1] > CALLOUT_COLOURED_SATURATION) & (
+        hsv[:, 2] > CALLOUT_COLOURED_MIN_VALUE
+    )
+
+    return float(coloured.mean())
+
+
+def extract_callout_comments(page, state=None, exclude_rects=None):
     """
     Returns [{"text", "rect", "method"}] for flattened callout boxes, in
-    logical reading order. `state` is accepted for compatibility and unused.
+    logical reading order. `state` is a dict shared across the pages of one
+    document; it remembers which way the callouts are turned.
+
+    Boxes that lie under a live comment (`exclude_rects`) are skipped before
+    any OCR runs: they are that comment, and reading them only costs time.
     """
 
     rects = find_callout_rects(page)
+
+    if exclude_rects:
+        rects = [
+            rect
+            for rect in rects
+            if not any(
+                _covered_share(rect, other) >= CALLOUT_SKIP_OVERLAP
+                for other in exclude_rects
+            )
+        ]
 
     if not rects:
         return []
@@ -1496,7 +1720,20 @@ def extract_callout_comments(page, state=None):
             direct = ""
 
         if len(direct) >= 2:
-            results.append({"text": direct, "rect": rect, "method": "text-layer"})
+
+            try:
+                share = coloured_text_share(_callout_image(page, rect))
+            except Exception:
+                share = 0.0
+
+            results.append(
+                {
+                    "text": direct,
+                    "rect": rect,
+                    "method": "text-layer",
+                    "coloured_text": share,
+                }
+            )
             continue
 
         if engine is None or cv2 is None:
@@ -1506,16 +1743,25 @@ def extract_callout_comments(page, state=None):
 
     if pending:
 
-        readings = _read_regions(engine, [image for _rect, image in pending])
+        readings = _read_regions_shared_turn(
+            engine, [image for _rect, image in pending], state
+        )
 
-        for (rect, _image), (text, name) in zip(pending, readings):
+        for (rect, image), (text, name) in zip(pending, readings):
 
             text = text.strip()
 
             if len(text) < 2 or not re.search(r"[A-Za-z0-9]", text):
                 continue
 
-            results.append({"text": text, "rect": rect, "method": name})
+            results.append(
+                {
+                    "text": text,
+                    "rect": rect,
+                    "method": name,
+                    "coloured_text": coloured_text_share(image),
+                }
+            )
 
     if not results:
         return results

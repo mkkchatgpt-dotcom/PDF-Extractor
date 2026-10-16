@@ -1408,6 +1408,10 @@ def extract_scanned_page_comments(
 # at least this many real words (2+ letters, no digits).
 CALLOUT_MIN_WORDS = 3
 
+# A callout whose writing is at least this share coloured (not black) is
+# always a comment, whatever its length.
+CALLOUT_COLOURED_TEXT_SHARE = 0.5
+
 _WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'’]+[.,:;?!)]*$")
 
 
@@ -1455,7 +1459,30 @@ def extract_callout_page_comments(page, page_number, records, record_id, state):
         and existing.get("_rect") is not None
     ]
 
-    for comment in ocr_scanned.extract_callout_comments(page, state):
+    # Boxes under ANY live markup (a text box, or a reviewer's rectangle /
+    # oval drawn around an old callout) are skipped before OCR. Highlights
+    # and links don't count: they draw no content of their own.
+    skip_rects = list(native_rects)
+
+    try:
+
+        for annotation in page.annots() or []:
+
+            if annotation.type[1] in TRANSPARENT_ANNOTATION_TYPES:
+                continue
+
+            if is_cad_or_hidden_annotation(annotation, annotation.info or {}):
+                continue
+
+            skip_rects.append(pymupdf.Rect(annotation.rect))
+
+    except Exception:
+
+        pass
+
+    for comment in ocr_scanned.extract_callout_comments(
+        page, state, exclude_rects=skip_rects
+    ):
 
         content = comment["text"].strip()
         rect = comment["rect"]
@@ -1463,10 +1490,14 @@ def extract_callout_page_comments(page, page_number, records, record_id, state):
         if not normalize_text(content):
             continue
 
-        # A boxed drawing label ("±1.6", "OUTLET 3\"-300# RTJ",
-        # "165-PSV-222A ...") is emphasis from an earlier review round,
-        # not a written comment.
-        if not looks_like_sentence(content):
+        # A box written in colour (blue / red callout text) is a reviewer's
+        # comment, however short ("LT-210407,LT-210411",
+        # "Haz.Area Class Ex-Certification"). A box with BLACK text is kept
+        # only if it reads as a sentence: short black labels ("±1.6",
+        # "165-PSV-222A") are drawing text highlighted in an earlier round.
+        coloured = comment.get("coloured_text", 0.0) >= CALLOUT_COLOURED_TEXT_SHARE
+
+        if not coloured and not looks_like_sentence(content):
             continue
 
         # The same comment already exists as a live annotation.
