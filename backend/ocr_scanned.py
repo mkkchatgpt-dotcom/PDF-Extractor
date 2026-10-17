@@ -1060,6 +1060,49 @@ def _blob_turns(img):
     return ["upright", "cw", "ccw"]
 
 
+# Detector settings for reading small blobs of ink.
+#
+# RapidOCR's default scales every image up until its SHORTER side is 736 px
+# and skips the detector for very wide images (width > 8 x height). For a
+# thin blob of handwriting that means a ~736 x 10 000 px image per attempt
+# (slow), or no detection at all for a long one-line note (garbled text).
+# Measured on the Butterfly-valve scan and the test scans:
+#     default        34 s, 63 % of characters right, 8/14 notes readable
+#     min 256 + det   6 s, 92 % of characters right, 12/14 notes readable
+BLOB_DET_LIMIT_TYPE = "min"
+BLOB_DET_LIMIT_SIDE = 256
+
+
+class _blob_detector_settings:
+    """Temporarily switch the engine to the blob settings above."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.saved = None
+
+    def __enter__(self):
+        try:
+            resize = self.engine.text_detector.preprocess_op[0]
+            self.saved = (
+                resize.limit_type,
+                resize.limit_side_len,
+                self.engine.width_height_ratio,
+            )
+            resize.limit_type = BLOB_DET_LIMIT_TYPE
+            resize.limit_side_len = BLOB_DET_LIMIT_SIDE
+            self.engine.width_height_ratio = -1  # always run the detector
+        except Exception:
+            self.saved = None  # different library version: keep defaults
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            resize = self.engine.text_detector.preprocess_op[0]
+            resize.limit_type, resize.limit_side_len, ratio = self.saved
+            self.engine.width_height_ratio = ratio
+        return False
+
+
 def _read_ink_blob(engine, image):
     """
     Read one blob of review ink, stopping at the first turn that gives text.
@@ -1137,9 +1180,10 @@ def extract_scanned_comments(page):
 
     results = []
 
-    for (x, y, w, h), image in zip(blobs, images):
+    with _blob_detector_settings(engine):
+        texts = [_read_ink_blob(engine, image) for image in images]
 
-        text = _read_ink_blob(engine, image)
+    for (x, y, w, h), text in zip(blobs, texts):
 
         if not _has_content(text, 3):
             continue
@@ -1359,6 +1403,110 @@ def _best_orientation_rows(engine, rgb):
     return best_rows, best_img
 
 
+GAP_LINE_MIN_HEIGHT_PX = 10
+GAP_LINE_MIN_CONFIDENCE = 0.6
+GAP_LINE_MIN_ALNUM = 4
+
+
+def _fill_missed_lines(engine, img, rows):
+    """
+    Read text lines the detector skipped.
+
+    The text detector occasionally misses a whole printed line at one
+    resolution (a typed "Point No.5" line was found at 150 and 300 DPI but
+    not at 220). Every horizontal band of ink on the page is located; a
+    band that no OCR row covers is cut out and given straight to the
+    recognizer. Bands that read as nothing confident (rules, signatures,
+    smudges) are ignored.
+    """
+
+    if not rows or cv2 is None:
+        return rows
+
+    try:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        threshold, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        ink = (gray < threshold).astype(np.uint8)
+
+        # Long ruled lines (tables, borders) are not text: remove them.
+        width = ink.shape[1]
+        rules = cv2.morphologyEx(
+            ink,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(10, width // 4), 1)),
+        )
+        ink = cv2.subtract(ink, rules)
+
+        profile = ink.sum(axis=1)
+    except Exception:
+        return rows
+
+    line_height = rows[0]["h"]
+    active = profile > max(2, 0.004 * width)
+
+    bands = []
+    start = None
+
+    for y, on in enumerate(active):
+        if on and start is None:
+            start = y
+        elif not on and start is not None:
+            bands.append((start, y))
+            start = None
+
+    if start is not None:
+        bands.append((start, len(active)))
+
+    added = []
+
+    for top, bottom in bands:
+
+        height = bottom - top
+
+        if height < GAP_LINE_MIN_HEIGHT_PX or height > 2.5 * line_height:
+            continue
+
+        middle = (top + bottom) / 2
+
+        if any(row["y0"] - 2 <= middle <= row["y1"] + 2 for row in rows):
+            continue  # already read
+
+        columns = np.where(ink[top:bottom].sum(axis=0) > 0)[0]
+
+        if len(columns) == 0:
+            continue
+
+        x0 = max(0, int(columns[0]) - LINE_PAD_PX)
+        x1 = min(img.shape[1], int(columns[-1]) + LINE_PAD_PX + 1)
+        y0 = max(0, top - LINE_PAD_PX)
+        y1 = min(img.shape[0], bottom + LINE_PAD_PX)
+
+        crop = np.ascontiguousarray(img[y0:y1, x0:x1])
+
+        if crop.shape[1] < 2 * crop.shape[0]:
+            continue  # not a line of text
+
+        try:
+            (text, confidence), = engine.text_recognizer([crop])[0]
+            confidence = float(confidence)
+        except Exception:
+            continue
+
+        text = str(text).strip()
+
+        if confidence < GAP_LINE_MIN_CONFIDENCE or sum(ch.isalnum() for ch in text) < GAP_LINE_MIN_ALNUM:
+            continue
+
+        added.append(
+            {"text": text, "x0": x0, "x1": x1, "y0": top, "y1": bottom, "h": line_height}
+        )
+
+    if not added:
+        return rows
+
+    return sorted(rows + added, key=lambda row: (row["y0"] + row["y1"]) / 2)
+
+
 def _clean_heading(text):
     text = re.sub(r"[\s:\-]+$", "", text.strip())
     return _respace(re.sub(r"\s+", " ", text))
@@ -1474,7 +1622,9 @@ def extract_text_sheet_comments(page, require_points=False):
 
     rgb, zoom = _render_page(page, dpi=TEXT_SHEET_DPI)
 
-    rows, _used = _best_orientation_rows(engine, np.ascontiguousarray(rgb))
+    rows, used = _best_orientation_rows(engine, np.ascontiguousarray(rgb))
+
+    rows = _fill_missed_lines(engine, used, rows)
 
     if len(rows) < TEXT_SHEET_MIN_ROWS:
         return []
@@ -1623,6 +1773,10 @@ def _callout_image(page, rect):
 
 CALLOUT_SKIP_OVERLAP = 0.3
 
+# Same threshold as pdf_extractor.CALLOUT_COLOURED_TEXT_SHARE: writing at
+# least this share coloured counts as a reviewer's (coloured) callout.
+CALLOUT_COLOURED_SHARE_KEEP = 0.5
+
 
 def _covered_share(rect, other):
     """Share of `rect` covered by `other` (0..1)."""
@@ -1679,7 +1833,9 @@ def coloured_text_share(img):
     return float(coloured.mean())
 
 
-def extract_callout_comments(page, state=None, exclude_rects=None):
+def extract_callout_comments(
+    page, state=None, exclude_rects=None, black_only_exclude_rects=None
+):
     """
     Returns [{"text", "rect", "method"}] for flattened callout boxes, in
     logical reading order. `state` is a dict shared across the pages of one
@@ -1700,6 +1856,32 @@ def extract_callout_comments(page, state=None, exclude_rects=None):
                 for other in exclude_rects
             )
         ]
+
+    # Under a reviewer's shape: skip only when the box's writing is black
+    # (a boxed drawing label). A quick colour check, no OCR.
+    if black_only_exclude_rects and cv2 is not None:
+
+        kept = []
+
+        for rect in rects:
+
+            covered = any(
+                _covered_share(rect, other) >= CALLOUT_SKIP_OVERLAP
+                for other in black_only_exclude_rects
+            )
+
+            if covered:
+                try:
+                    share = coloured_text_share(_callout_image(page, rect))
+                except Exception:
+                    share = 0.0
+
+                if share < CALLOUT_COLOURED_SHARE_KEEP:
+                    continue
+
+            kept.append(rect)
+
+        rects = kept
 
     if not rects:
         return []

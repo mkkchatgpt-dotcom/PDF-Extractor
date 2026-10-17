@@ -21,6 +21,7 @@ After all pages, duplicates are removed and record IDs are renumbered.
 from datetime import datetime
 import re
 import math
+import time
 
 import pymupdf
 
@@ -58,6 +59,10 @@ TRANSPARENT_ANNOTATION_TYPES = {
     "Link",
     "Popup",
 }
+
+# Reviewer shapes draw lines only, never text of their own. Coloured page
+# text inside one is a flattened comment the reviewer has boxed / clouded.
+TEXTLESS_SHAPE_TYPES = {"Square", "Circle", "Polygon", "PolyLine", "Line", "Ink"}
 
 # Pen (Ink) strokes read with OCR. Not exported.
 EXTRACT_PEN_MARKS = False
@@ -363,7 +368,41 @@ def rectangle_intersection_ratio(word_rect, highlight_rect):
 # ============================================================
 
 
-def is_duplicate_record(existing_records, page_number, text, rect=None):
+# Two separate live annotations with the same text are two comments (the
+# same remark placed on two fields). They are merged only when one sits
+# almost exactly on top of the other: this share of the smaller box covered.
+SAME_ANNOTATION_OVERLAP = 0.8
+
+
+def _smaller_box_covered(rect1, rect2):
+    try:
+        common = rect1 & rect2
+
+        if common.is_empty:
+            return 0.0
+
+        smaller = min(rect1.get_area(), rect2.get_area())
+
+        return (common.width * common.height) / smaller if smaller > 0 else 0.0
+
+    except Exception:
+        return 0.0
+
+
+def is_duplicate_record(
+    existing_records, page_number, text, rect=None, object_type=None
+):
+    """
+    True when the same comment is already recorded.
+
+    Two different PASSES finding one comment (a text box and its printed
+    copy, an OCR reading of a box already read) are matched loosely: same
+    text close by. Two objects from the SAME pass (two live annotations,
+    two ink blobs, two callout boxes) are different places on the page and
+    are only merged when stacked almost exactly on top of each other.
+    `object_type` is the record's object_type ("Annotation", "Page Content",
+    "Scanned Content", "Callout", "Coloured Markup").
+    """
 
     normalized_new_text = normalize_text(text)
 
@@ -382,10 +421,22 @@ def is_duplicate_record(existing_records, page_number, text, rect=None):
 
         existing_rect = existing.get("_rect")
 
+        # Same pass (two annotations, two ink blobs, two callout boxes):
+        # these are different objects on the page, so they are only the
+        # same comment when stacked on top of each other.
+        same_pass = object_type is not None and existing.get("object_type") == object_type
+
         # If position isn't available,
         # same page + same text = duplicate.
         if existing_rect is None or rect is None:
+            if same_pass:
+                continue
             return True
+
+        if same_pass:
+            if _smaller_box_covered(existing_rect, rect) >= SAME_ANNOTATION_OVERLAP:
+                return True
+            continue
 
         if rectangles_overlap(existing_rect, rect):
             return True
@@ -846,9 +897,100 @@ def group_colored_spans(spans):
 
         if combined_text:
 
-            results.append({"text": combined_text, "rect": group["rect"]})
+            results.append(
+                {"text": combined_text, "rect": group["rect"], "parts": text_parts}
+            )
 
     return results
+
+
+# ============================================================
+# TEMPLATE TEXT (coloured, but part of the document itself)
+# ============================================================
+#
+# Some documents print parts of their own template in colour: the document
+# number on the cover, a "controlled document" notice, the names in a
+# signature block. That is not a reviewer's comment.
+
+# Legal / control notices printed by document templates (case-insensitive).
+TEMPLATE_NOTICE_PHRASES = (
+    "controlled document",
+    "uncontrolled copy",
+    "un-authorised modification",
+    "unauthorised modification",
+    "unauthorized modification",
+    "all rights reserved",
+    "proprietary and confidential",
+)
+
+# Form-field labels. A coloured group in which one line is just a label
+# like this is a filled-in form field (a signature block), not a comment.
+TEMPLATE_FIELD_LABELS = {
+    "signature",
+    "sign",
+    "signed",
+    "name",
+    "date",
+    "prepared by",
+    "checked by",
+    "approved by",
+    "reviewed by",
+    "author",
+}
+
+# A document number / code: one token, no spaces, letters and digits mixed.
+_CODE_RE = re.compile(r"^(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9][A-Za-z0-9._/\-]{7,}$")
+
+
+def _label_key(text):
+    """'Signature / Подпись' -> 'signature' (drop translations and punctuation)."""
+
+    first = re.split(r"\s*/\s*", text.strip())[0]
+    return re.sub(r"[^a-z ]", "", first.lower()).strip()
+
+
+def page_plain_text(page):
+    """All NON-coloured text of the page, whitespace-normalised."""
+
+    parts = []
+
+    try:
+        for block in page.get_text("dict").get("blocks", []):
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if not is_review_color(span.get("color", 0)):
+                        parts.append(span.get("text", ""))
+    except Exception:
+        pass
+
+    return re.sub(r"\s+", " ", " ".join(parts))
+
+
+def is_template_text(group, plain_text):
+    """
+    True when a coloured text group is part of the document template.
+
+      * the document's own number / code, coloured for emphasis - the same
+        code also appears in black on the page (header, title block);
+      * a standard control / legal notice;
+      * a filled-in form field: one of its lines is just a field label
+        ("Signature / Подпись", "Prepared by").
+    """
+
+    text = group["text"].strip()
+
+    if _CODE_RE.match(text) and text in plain_text:
+        return True
+
+    lowered = text.lower()
+
+    if any(phrase in lowered for phrase in TEMPLATE_NOTICE_PHRASES):
+        return True
+
+    if any(_label_key(part) in TEMPLATE_FIELD_LABELS for part in group.get("parts", [])):
+        return True
+
+    return False
 
 
 # ============================================================
@@ -1026,7 +1168,9 @@ def extract_native_annotations(page, page_number, records, record_id):
             # DUPLICATE CHECK
             # =================================================
 
-            if is_duplicate_record(records, page_number, content, annotation_rect):
+            if is_duplicate_record(
+                records, page_number, content, annotation_rect, object_type="Annotation"
+            ):
 
                 continue
 
@@ -1104,14 +1248,25 @@ def extract_colored_page_comments(page, page_number, records, record_id):
 
     # PyMuPDF also reports the text DRAWN BY annotations (a red "APPROVED"
     # stamp, a text box) as page text. That is the annotation, not
-    # flattened page content, so text inside any annotation that draws
-    # its own content is ignored too - including types that are not
-    # exported (Stamp, shapes, form fields).
+    # flattened page content, so text inside an annotation that draws its
+    # own text is ignored too (Stamp, form fields, AutoCAD's hidden text
+    # boxes...).
+    #
+    # A reviewer's SHAPE (rectangle, oval, cloud, line, pen stroke) draws
+    # no text: a reviewer often draws one AROUND a flattened comment to
+    # make it stand out, so the text inside it must still be read.
     try:
 
         for annotation in page.annots() or []:
 
-            if annotation.type[1] in TRANSPARENT_ANNOTATION_TYPES:
+            kind = annotation.type[1]
+
+            if kind in TRANSPARENT_ANNOTATION_TYPES:
+                continue
+
+            if kind in TEXTLESS_SHAPE_TYPES and not is_cad_or_hidden_annotation(
+                annotation, annotation.info or {}
+            ):
                 continue
 
             native_rects.append(pymupdf.Rect(annotation.rect))
@@ -1138,6 +1293,14 @@ def extract_colored_page_comments(page, page_number, records, record_id):
     # ============================================================
 
     grouped_comments = group_colored_spans(colored_spans)
+
+    # Drop coloured text that belongs to the document template (its own
+    # number, a control notice, a signature block).
+    if grouped_comments:
+        plain_text = page_plain_text(page)
+        grouped_comments = [
+            group for group in grouped_comments if not is_template_text(group, plain_text)
+        ]
 
     # ============================================================
     # PROCESS EACH COLOURED GROUP
@@ -1279,7 +1442,7 @@ def extract_colored_page_comments(page, page_number, records, record_id):
         # NORMAL DUPLICATE CHECK
         # ========================================================
 
-        if is_duplicate_record(records, page_number, content, rect):
+        if is_duplicate_record(records, page_number, content, rect, object_type="Page Content"):
 
             continue
 
@@ -1376,7 +1539,7 @@ def extract_scanned_page_comments(
         if already_native:
             continue
 
-        if is_duplicate_record(records, page_number, content, rect):
+        if is_duplicate_record(records, page_number, content, rect, object_type="Scanned Content"):
             continue
 
         records.append(
@@ -1459,29 +1622,40 @@ def extract_callout_page_comments(page, page_number, records, record_id, state):
         and existing.get("_rect") is not None
     ]
 
-    # Boxes under ANY live markup (a text box, or a reviewer's rectangle /
-    # oval drawn around an old callout) are skipped before OCR. Highlights
-    # and links don't count: they draw no content of their own.
+    # Boxes under a live TEXT annotation (a text box, a stamp) are that
+    # annotation and are skipped before OCR. Boxes under a reviewer's SHAPE
+    # (a rectangle / oval drawn around an old callout) are skipped only when
+    # their writing is black - a coloured callout circled by the reviewer is
+    # still a comment. Highlights and links draw nothing and don't count.
     skip_rects = list(native_rects)
+    shape_rects = []
 
     try:
 
         for annotation in page.annots() or []:
 
-            if annotation.type[1] in TRANSPARENT_ANNOTATION_TYPES:
+            kind = annotation.type[1]
+
+            if kind in TRANSPARENT_ANNOTATION_TYPES:
                 continue
 
             if is_cad_or_hidden_annotation(annotation, annotation.info or {}):
                 continue
 
-            skip_rects.append(pymupdf.Rect(annotation.rect))
+            if kind in TEXTLESS_SHAPE_TYPES:
+                shape_rects.append(pymupdf.Rect(annotation.rect))
+            else:
+                skip_rects.append(pymupdf.Rect(annotation.rect))
 
     except Exception:
 
         pass
 
     for comment in ocr_scanned.extract_callout_comments(
-        page, state, exclude_rects=skip_rects
+        page,
+        state,
+        exclude_rects=skip_rects,
+        black_only_exclude_rects=shape_rects,
     ):
 
         content = comment["text"].strip()
@@ -1504,7 +1678,7 @@ def extract_callout_page_comments(page, page_number, records, record_id, state):
         if any(overlap_fraction(rect, native) >= 0.3 for native in native_rects):
             continue
 
-        if is_duplicate_record(records, page_number, content, rect):
+        if is_duplicate_record(records, page_number, content, rect, object_type="Callout"):
             continue
 
         records.append(
@@ -1552,7 +1726,7 @@ def add_markup_records(
         ) and len(re.sub(r"[\W_]", "", content)) < 2:
             continue
 
-        if is_duplicate_record(records, page_number, content, rect):
+        if is_duplicate_record(records, page_number, content, rect, object_type="Coloured Markup"):
             continue
 
         records.append(
@@ -1646,7 +1820,9 @@ def remove_final_duplicates(records):
 
         rect = record.get("_rect")
 
-        if is_duplicate_record(unique_records, page_number, text, rect):
+        if is_duplicate_record(
+            unique_records, page_number, text, rect, object_type=record.get("object_type")
+        ):
 
             continue
 
@@ -1683,6 +1859,54 @@ def clean_internal_fields(records):
 # ============================================================
 # MAIN PDF EXTRACTION
 # ============================================================
+
+
+# Pages slower than this are reported in the console window.
+SLOW_PAGE_SECONDS = 5.0
+
+
+def log(message):
+    """Progress / problem messages for the console window (never fails)."""
+
+    try:
+        print(f"[PDF Review Extractor] {message}", flush=True)
+    except Exception:
+        pass
+
+
+def _read_scanned_page(page, page_number, records, record_id, scanned_text_mode, summary):
+    """
+    OCR one scanned page: a typed comment sheet is read in full (one record
+    per numbered point), anything else only for its coloured ink.
+    """
+
+    mode = (scanned_text_mode or "auto").lower()
+
+    sheet_comments = []
+
+    if mode == "all":
+
+        sheet_comments = ocr_scanned.extract_text_sheet_comments(page)
+
+    elif mode == "auto" and ocr_scanned.is_text_sheet(page):
+
+        # Only accepted when numbered points are found.
+        sheet_comments = ocr_scanned.extract_text_sheet_comments(page, require_points=True)
+
+    if sheet_comments:
+
+        summary["text_sheet_pages"] += 1
+
+        return extract_scanned_page_comments(
+            page,
+            page_number,
+            records,
+            record_id,
+            comments=sheet_comments,
+            annotation_type="TypedText (OCR)",
+        )
+
+    return extract_scanned_page_comments(page, page_number, records, record_id)
 
 
 def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
@@ -1725,27 +1949,53 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
         # PAGE LOOP
         # ====================================================
 
+        # Every pass on every page is run through this: an error in one pass
+        # (a damaged page, an odd drawing) is logged and that pass skipped,
+        # instead of failing the whole PDF.
+        def run_pass(name, page_number, func, *args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                message = f"page {page_number}, {name}: {type(exc).__name__}: {exc}"
+                summary["page_errors"].append(message)
+                log(f"  ! {file_label}: {message}")
+                return None
+
+        summary["page_errors"] = []
+        file_label = getattr(pdf_path, "name", str(pdf_path))
+        started = time.time()
+        log(f"Reading {file_label} ({len(document)} pages)...")
+
         for page_number in range(1, len(document) + 1):
 
-            page = document.load_page(page_number - 1)
+            page_started = time.time()
+
+            try:
+                page = document.load_page(page_number - 1)
+            except Exception as exc:
+                summary["page_errors"].append(f"page {page_number}: cannot open: {exc}")
+                log(f"  ! {file_label}: page {page_number} cannot be opened: {exc}")
+                continue
 
             # =================================================
             # PASS 1
             # NATIVE ANNOTATIONS
             # =================================================
 
-            record_id = extract_native_annotations(
-                page, page_number, records, record_id
-            )
+            record_id = run_pass(
+                "annotations", page_number,
+                extract_native_annotations, page, page_number, records, record_id,
+            ) or record_id
 
             # =================================================
             # PASS 2
             # FLATTENED COLOURED TEXT
             # =================================================
 
-            record_id = extract_colored_page_comments(
-                page, page_number, records, record_id
-            )
+            record_id = run_pass(
+                "coloured text", page_number,
+                extract_colored_page_comments, page, page_number, records, record_id,
+            ) or record_id
 
             # =================================================
             # PASS 2B
@@ -1754,52 +2004,24 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
             #   typed comment sheet -> read the whole page, one
             #                          record per numbered point
             #   drawing / form      -> read only the coloured ink
-            #                          (red, orange, gold, green, blue)
             # =================================================
 
-            if ocr_scanned.is_scanned_page(page):
+            scanned = run_pass(
+                "scan check", page_number, ocr_scanned.is_scanned_page, page
+            )
+
+            if scanned:
 
                 summary["scanned_pages"] += 1
 
-                if not summary["ocr_available"]:
+                if summary["ocr_available"]:
 
-                    pass
-
-                else:
-
-                    mode = (scanned_text_mode or "auto").lower()
-
-                    sheet_comments = []
-
-                    if mode == "all":
-
-                        sheet_comments = ocr_scanned.extract_text_sheet_comments(page)
-
-                    elif mode == "auto" and ocr_scanned.is_text_sheet(page):
-
-                        # Only accepted when numbered points are found.
-                        sheet_comments = ocr_scanned.extract_text_sheet_comments(
-                            page, require_points=True
-                        )
-
-                    if sheet_comments:
-
-                        summary["text_sheet_pages"] += 1
-
-                        record_id = extract_scanned_page_comments(
-                            page,
-                            page_number,
-                            records,
-                            record_id,
-                            comments=sheet_comments,
-                            annotation_type="TypedText (OCR)",
-                        )
-
-                    else:
-
-                        record_id = extract_scanned_page_comments(
-                            page, page_number, records, record_id
-                        )
+                    record_id = run_pass(
+                        "scanned page OCR", page_number,
+                        _read_scanned_page,
+                        page, page_number, records, record_id,
+                        scanned_text_mode, summary,
+                    ) or record_id
 
             # =================================================
             # PASS 2C
@@ -1808,11 +2030,18 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
 
             before = len(records)
 
-            record_id = extract_callout_page_comments(
-                page, page_number, records, record_id, callout_state
-            )
+            record_id = run_pass(
+                "callouts", page_number,
+                extract_callout_page_comments,
+                page, page_number, records, record_id, callout_state,
+            ) or record_id
 
             summary["callouts"] += len(records) - before
+
+            seconds = time.time() - page_started
+
+            if seconds >= SLOW_PAGE_SECONDS:
+                log(f"  {file_label}: page {page_number} took {seconds:.1f}s")
 
             if not coloured_markup or not summary["ocr_available"]:
                 continue
@@ -1826,12 +2055,14 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
 
                 before = len(records)
 
+                ink = run_pass("pen marks", page_number, ocr_scanned.extract_ink_comments, page)
+
                 record_id = add_markup_records(
                     page,
                     page_number,
                     records,
                     record_id,
-                    ocr_scanned.extract_ink_comments(page),
+                    ink or [],
                     "Ink (OCR)",
                 )
 
@@ -1843,7 +2074,7 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
             # (scanned pages are handled by the ink pass above)
             # =================================================
 
-            if not EXTRACT_HIGHLIGHT_REGIONS or ocr_scanned.is_scanned_page(page):
+            if not EXTRACT_HIGHLIGHT_REGIONS or scanned:
                 continue
 
             before = len(records)
@@ -1860,7 +2091,10 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
                 page_number,
                 records,
                 record_id,
-                ocr_scanned.extract_highlight_comments(page, exclude_rects=exclude),
+                run_pass(
+                    "highlights", page_number,
+                    ocr_scanned.extract_highlight_comments, page, exclude_rects=exclude,
+                ) or [],
                 "Highlight (OCR)",
                 author_field=False,
             )
@@ -1877,6 +2111,13 @@ def extract_pdf(pdf_path, scanned_text_mode="auto", coloured_markup=True):
         records = remove_final_duplicates(records)
 
         summary["annotations"] = len(records)
+
+        summary["seconds"] = round(time.time() - started, 1)
+
+        log(
+            f"Done {file_label}: {len(records)} comments in {summary['seconds']}s"
+            + (f", {len(summary['page_errors'])} page error(s)" if summary["page_errors"] else "")
+        )
 
         # Remove _rect before sending data to frontend/Excel.
         records = clean_internal_fields(records)

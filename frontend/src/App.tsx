@@ -13,7 +13,7 @@ type RecordItem = {
 };
 type FileResult = {
   filename: string;
-  summary: { pages: number; annotations: number; scanned_pages?: number; text_sheet_pages?: number; callouts?: number; ink_marks?: number; highlight_regions?: number; ocr_available?: boolean; ocr_error?: string | null };
+  summary: { pages: number; annotations: number; scanned_pages?: number; text_sheet_pages?: number; callouts?: number; ink_marks?: number; highlight_regions?: number; ocr_available?: boolean; ocr_error?: string | null; page_errors?: string[]; seconds?: number };
   records: RecordItem[];
   success: boolean;
   error: string | null;
@@ -118,7 +118,7 @@ export default function App() {
             </div>
           )}
           <button type="button" className="primary" disabled={!files.length || busy} onClick={extract}>{busy ? `Extracting ${files.length} PDF(s)…` : files.length > 1 ? `Extract All ${files.length} PDFs` : "Extract PDF"}</button>
-          {busy && <div className="processing-message" role="status">Processing PDFs and generating Excel files…</div>}
+          {busy && <div className="processing-message" role="status">Processing PDFs and generating Excel files… Normal PDFs take a few seconds; scanned pages are read with OCR and can take 5–15 seconds per page. Progress is shown in the black console window.</div>}
           {error && <div className="error" role="alert">{error}</div>}
         </section>
         {result && (
@@ -150,6 +150,7 @@ export default function App() {
                     {!!pdf.summary.ink_marks && <div><span>Pen marks</span><strong>{pdf.summary.ink_marks}</strong></div>}
                   </div>
                   {!!pdf.summary.scanned_pages && pdf.summary.ocr_available === false && <div className="error">This PDF contains {pdf.summary.scanned_pages} scanned page(s), but the OCR engine could not be started, so scanned comments could not be read.{pdf.summary.ocr_error ? <><br /><small>Reason: {pdf.summary.ocr_error}</small></> : null}</div>}
+                  {!!pdf.summary.page_errors?.length && <div className="error">Some parts of this PDF could not be read, so a few comments may be missing:<ul>{pdf.summary.page_errors.map((message, i) => <li key={i}><small>{message}</small></li>)}</ul></div>}
                   <div className="table-wrap"><table>
                     <thead><tr>{HEADERS.map(header => <th key={header} scope="col">{header}</th>)}</tr></thead>
                     <tbody>{!pdf.records.length ? <tr><td colSpan={HEADERS.length} className="empty">No PDF annotations were found.</td></tr> : pdf.records.map((item, index) => (
